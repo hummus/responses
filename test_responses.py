@@ -289,7 +289,7 @@ def test_activate_doesnt_change_signature_for_method():
 
 
 @pytest.mark.skipif(grequests is None,
-                    reason="requires grequests")
+    reason="requires grequests")
 def test_response_grequests():
     @responses.activate
     def run():
@@ -305,6 +305,42 @@ def test_response_grequests():
         assert len(responses.calls) == 2
         assert responses.calls[1].request.url == 'http://example.com/?foo=bar'
         assert responses.calls[1].response.content == b'test'
+
+    run()
+    assert_reset()
+
+
+def test_allow_redirects():
+    redirecting_url = 'http://example.com'
+    final_url = 'http://example.com/2'
+    url_re = re.compile(r'^http://example.com(/)?(\d+)?$')
+
+    def request_callback(request):
+        if request.url.endswith('/2'):
+            return 200, (), b'test'
+        else:
+            if request.url.endswith('0'):
+                n = 1
+            elif request.url.endswith('1'):
+                n = 2
+            else:
+                n = 0
+            redirect_headers = {'location': '/{!s}'.format(n)}
+            return 301, redirect_headers, None
+
+    @responses.activate
+    def run():
+        # setup redirect
+        responses.add_callback(responses.GET, url_re, request_callback)
+
+        resp_no_redirects = requests.get(redirecting_url, allow_redirects=False)
+        assert resp_no_redirects.status_code == 301
+        assert resp_no_redirects.url != final_url
+
+        resp_yes_redirects = requests.get(redirecting_url, allow_redirects=True)
+        assert len(resp_yes_redirects.history) == 3
+        assert resp_yes_redirects.status_code == 200
+        assert resp_yes_redirects.url == final_url
 
     run()
     assert_reset()

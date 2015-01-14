@@ -32,10 +32,11 @@ else:
 import inspect
 from collections import namedtuple, Sequence, Sized
 from functools import update_wrapper
-from requests.exceptions import ConnectionError
-from requests.models import Response
+from requests.exceptions import ConnectionError, TooManyRedirects
+from requests.models import Response, Request
 from requests.structures import CaseInsensitiveDict
-from requests.utils import get_encoding_from_headers
+from requests.utils import get_encoding_from_headers, requote_uri
+from requests.status_codes import codes
 
 try:
     from requests.packages.urllib3.response import HTTPResponse
@@ -48,7 +49,7 @@ else:
     from urllib.parse import urlparse, parse_qsl
 
 from requests.compat import (
-    cookielib
+    cookielib, urljoin
 )
 
 
@@ -59,6 +60,97 @@ def wrapper%(signature)s:
     with responses:
         return func%(funcargs)s
 """
+
+REDIRECT_STATI = (codes.moved, codes.found, codes.other, codes.temporary_moved)
+
+
+# mostly pulled from requests.models.Request._build_response
+def resolve_redirects(response, request, **resolve_kwargs):
+    history = []
+
+    if not response.status_code in REDIRECT_STATI:
+        return
+
+    while ('location' in response.headers):
+        response.content  # Consume socket so it can be released
+
+        if not len(history) < request.config.get('max_redirects'):
+            raise TooManyRedirects()
+
+        # Release the connection back into the pool.
+        response.raw.release_conn()
+
+        history.append(response)
+
+        url = response.headers['location']
+        data = None  # self.data
+        files = None  # self.files
+
+        # Handle redirection without scheme (see: RFC 1808 Section 4)
+        if url.startswith('//'):
+            parsed_rurl = urlparse(response.url)
+            url = '%s:%s' % (parsed_rurl.scheme, url)
+
+        # Facilitate non-RFC2616-compliant 'location' headers
+        # (e.g. '/path/to/resource' instead of 'http://domain.tld/path/to/resource')
+        if not urlparse(url).netloc:
+            url = urljoin(response.url,
+                          # Compliant with RFC3986, we percent
+                          # encode the url.
+                          requote_uri(url))
+
+        # http://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html#sec10.3.4
+        if response.status_code is codes.see_other:
+            method = 'GET'
+            data = None
+            files = None
+        else:
+            method = request.method
+
+        # Do what the browsers do if strict_mode is off...
+        if (not request.config.get('strict_mode')):
+
+            if response.status_code in (codes.moved, codes.found) and request.method == 'POST':
+                method = 'GET'
+                data = None
+                files = None
+
+            if (response.status_code == 303) and request.method != 'HEAD':
+                method = 'GET'
+                data = None
+                files = None
+
+        # Remove the cookie headers that were sent.
+        headers = request.headers
+        try:
+            del headers['Cookie']
+        except KeyError:
+            pass
+
+        request_next = Request(
+            url=url,
+            headers=headers,
+            files=files,
+            method=method,
+            redirect=True,
+            data=data,
+            params=request.session.params,
+            auth=request.auth,
+            cookies=request.cookies,
+            config=request.config,
+            timeout=request.timeout,
+            _poolmanager=request._poolmanager,
+            proxies=request.proxies,
+            verify=request.verify,
+            session=request.session,
+            cert=request.cert,
+            prefetch=request.prefetch,
+        )
+
+        request_next.send()
+        response = request_next.response
+        response.history = history
+        yield response
 
 # mostly pulled from requests.models.Request._build_response
 def build_response(req, resp):
@@ -305,8 +397,30 @@ class RequestsMock(object):
             response.content  # NOQA
 
         self._calls.add(request, response)
-        request.response = response
 
+        ## begin stuff for allow_redirects=True 
+        if kwargs.get('allow_redirects', False):
+            # include some redirect resolving logic from 
+            # requests.sessions.Session
+            resolve_kwargs = {k: v for (k, v) in kwargs.items() if
+                              k in ('stream', 'timeout', 'cert', 'proxies')}
+            
+            # this recurses if response.is_redirect, 
+            # but limited by session.max_redirects
+            gen = resolve_redirects(response, request, **resolve_kwargs)
+
+            history = [resp for resp in gen] if kwargs.get('allow_redirects') else []
+
+            # Shuffle things around if there's history.
+            if history:
+                # Insert the first (original) request at the start
+                history.insert(0, response)
+                # Get the last request made
+                response = history.pop()
+                response.history = history
+        #</allow_redirects>
+
+        request.response = response
         return response
 
     def start(self):
@@ -315,6 +429,7 @@ class RequestsMock(object):
         def unbound_on_send(rself, *a, **kwargs):
             session = None
             rself.url = _ensure_url_default_path(rself.url, '?' in rself.url)
+            kwargs.update({'allow_redirects': rself.allow_redirects})
             return self._on_request(session, rself, *a, **kwargs)
         self._patcher = mock.patch('requests.models.Request.send', unbound_on_send)
         self._patcher.start()
