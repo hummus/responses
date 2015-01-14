@@ -7,15 +7,20 @@ import re
 import requests
 import responses
 import pytest
+try: 
+    import grequests
+except:
+    grequests = None
+    pass
 
 from inspect import getargspec
 from requests.exceptions import ConnectionError, HTTPError
 
+xfail = pytest.mark.xfail()
 
 def assert_reset():
     assert len(responses._default_mock._urls) == 0
     assert len(responses.calls) == 0
-
 
 def assert_response(resp, body=None):
     assert resp.status_code == 200
@@ -210,7 +215,7 @@ def test_regular_expression_url():
     run()
     assert_reset()
 
-
+@xfail(reason="requests before v1.0  does not support adapters")
 def test_custom_adapter():
     @responses.activate
     def run():
@@ -281,3 +286,25 @@ def test_activate_doesnt_change_signature_for_method():
     assert argspec == getargspec(decorated_test_function)
     assert decorated_test_function(1, 2) == test_case.test_function(1, 2)
     assert decorated_test_function(3) == test_case.test_function(3)
+
+
+@pytest.mark.skipif(grequests is None,
+                    reason="requires grequests")
+def test_response_grequests():
+    @responses.activate
+    def run():
+        responses.add(responses.GET, 'http://example.com', body=b'test')
+        resp = grequests.map((grequests.get('http://example.com'),))[0]
+        assert_response(resp, 'test')
+        assert len(responses.calls) == 1
+        assert responses.calls[0].request.url == 'http://example.com/'
+        assert responses.calls[0].response.content == b'test'
+
+        resp = requests.get('http://example.com?foo=bar')
+        assert_response(resp, 'test')
+        assert len(responses.calls) == 2
+        assert responses.calls[1].request.url == 'http://example.com/?foo=bar'
+        assert responses.calls[1].response.content == b'test'
+
+    run()
+    assert_reset()

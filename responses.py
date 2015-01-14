@@ -33,14 +33,23 @@ import inspect
 from collections import namedtuple, Sequence, Sized
 from functools import update_wrapper
 from requests.exceptions import ConnectionError
+from requests.models import Response
+from requests.structures import CaseInsensitiveDict
+from requests.utils import get_encoding_from_headers
+
 try:
     from requests.packages.urllib3.response import HTTPResponse
 except ImportError:
     from urllib3.response import HTTPResponse
+
 if six.PY2:
     from urlparse import urlparse, parse_qsl
 else:
     from urllib.parse import urlparse, parse_qsl
+
+from requests.compat import (
+    cookielib
+)
 
 
 Call = namedtuple('Call', ['request', 'response'])
@@ -50,6 +59,44 @@ def wrapper%(signature)s:
     with responses:
         return func%(funcargs)s
 """
+
+# mostly pulled from requests.models.Request._build_response
+def build_response(req, resp):
+    """Builds a :class:`Response <requests.Response>` object from a urllib3
+    response. This should not be called from user code, and is only exposed
+    for use when subclassing the
+    :class:`HTTPAdapter <requests.adapters.HTTPAdapter>`
+    :param req: The :class:`PreparedRequest <PreparedRequest>` used to generate the response.
+    :param resp: The urllib3 response object.
+    """
+    response = Response()
+    response.cookies = cookielib.CookieJar()
+
+    # Fallback to None if there's no status_code, for whatever reason.
+    response.status_code = getattr(resp, 'status', None)
+
+    # Make headers case-insensitive.
+    response.headers = CaseInsensitiveDict(getattr(resp, 'headers', {}))
+
+    # Set encoding.
+    response.encoding = get_encoding_from_headers(response.headers)
+    response.raw = resp
+    #already a property pointing to raw.reason in v0.14.2
+    #response.reason = response.raw.reason
+
+    if isinstance(req.url, bytes):
+        response.url = req.url.decode('utf-8')
+    else:
+        response.url = req.url
+
+    # Add new cookies from the server.
+    #extract_cookies_to_jar(response.cookies, req, resp)
+
+    # Give the Response some context.
+    response.request = req
+    response.connection = None
+
+    return response
 
 
 def get_wrapped(func, wrapper_template, evaldict):
@@ -96,6 +143,20 @@ class CallList(Sequence, Sized):
         self._calls = []
 
 
+def _is_string(s):
+    return isinstance(s, (six.string_types, six.text_type))
+
+
+def _ensure_url_default_path(url, match_querystring=False):
+    # ensure the url has a default path set if the url is a string
+    if _is_string(url) and url.count('/') == 2:
+        if match_querystring:
+            return url.replace('?', '/?', 1)  
+        else:
+            return url + '/'
+    return url
+
+
 class RequestsMock(object):
     DELETE = 'DELETE'
     GET = 'GET'
@@ -117,10 +178,7 @@ class RequestsMock(object):
             status=200, adding_headers=None, stream=False,
             content_type='text/plain'):
 
-        # ensure the url has a default path set if the url is a string
-        if self._is_string(url) and url.count('/') == 2:
-            url = url.replace('?', '/?', 1) if match_querystring \
-                else url + '/'
+        url = _ensure_url_default_path(url, match_querystring)
 
         # body must be bytes
         if isinstance(body, six.text_type):
@@ -139,6 +197,8 @@ class RequestsMock(object):
 
     def add_callback(self, method, url, callback, match_querystring=False,
                      content_type='text/plain'):
+        # ensure the url has a default path set if the url is a string
+        url = _ensure_url_default_path(url, match_querystring)
 
         self._urls.append({
             'url': url,
@@ -176,12 +236,14 @@ class RequestsMock(object):
         return None
 
     def _has_url_match(self, match, request_url):
+        #url = _ensure_url_default_path(match['url'])
         url = match['url']
 
-        if self._is_string(url):
+        if _is_string(url):
             if match['match_querystring']:
                 return self._has_strict_url_match(url, request_url)
             else:
+                #url_without_qs = _ensure_url_default_path(request_url.split('?', 1)[0])
                 url_without_qs = request_url.split('?', 1)[0]
                 return url == url_without_qs
         elif isinstance(url, re._pattern_type) and url.match(request_url):
@@ -189,7 +251,8 @@ class RequestsMock(object):
         else:
             return False
 
-    def _has_strict_url_match(self, url, other):
+    @staticmethod
+    def _has_strict_url_match(url, other):
         url_parsed = urlparse(url)
         other_parsed = urlparse(other)
 
@@ -200,12 +263,8 @@ class RequestsMock(object):
         other_qsl = sorted(parse_qsl(other_parsed.query))
         return url_qsl == other_qsl
 
-    def _is_string(self, s):
-        return isinstance(s, (six.string_types, six.text_type))
-
     def _on_request(self, session, request, **kwargs):
         match = self._find_match(request)
-
         # TODO(dcramer): find the correct class for this
         if match is None:
             error_msg = 'Connection refused: {0}'.format(request.url)
@@ -213,7 +272,6 @@ class RequestsMock(object):
 
             self._calls.add(request, response)
             raise response
-
         if 'body' in match and isinstance(match['body'], Exception):
             self._calls.add(request, match['body'])
             raise match['body']
@@ -221,7 +279,6 @@ class RequestsMock(object):
         headers = {
             'Content-Type': match['content_type'],
         }
-
         if 'callback' in match:  # use callback
             status, r_headers, body = match['callback'](request)
             if isinstance(body, six.text_type):
@@ -240,24 +297,26 @@ class RequestsMock(object):
             body=body,
             headers=headers,
             preload_content=False,
+            original_response=namedtuple('OR', 'msg')(''),
         )
-
-        adapter = session.get_adapter(request.url)
-
-        response = adapter.build_response(request, response)
+        response = build_response(request, response)
+        response._content = body.getvalue()
         if not match.get('stream'):
             response.content  # NOQA
 
         self._calls.add(request, response)
+        request.response = response
 
         return response
 
     def start(self):
         import mock
 
-        def unbound_on_send(session, requests, *a, **kwargs):
-            return self._on_request(session, requests, *a, **kwargs)
-        self._patcher = mock.patch('requests.Session.send', unbound_on_send)
+        def unbound_on_send(rself, *a, **kwargs):
+            session = None
+            rself.url = _ensure_url_default_path(rself.url, '?' in rself.url)
+            return self._on_request(session, rself, *a, **kwargs)
+        self._patcher = mock.patch('requests.models.Request.send', unbound_on_send)
         self._patcher.start()
 
     def stop(self):
